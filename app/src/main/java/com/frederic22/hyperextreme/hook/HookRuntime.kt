@@ -326,7 +326,10 @@ internal object HookRuntime {
      */
     private var remotePreferences: android.content.SharedPreferences? = null
 
-    /** 兜底通道：把模块 `shared_prefs/<name>.xml` 原文读回来（[XposedInterface.openRemoteFile]）。 */
+    /**
+     * 兜底通道：把模块 `files/<name>.xml` 原文读回来（[XposedInterface.openRemoteFile]，
+     * 只接受**裸文件名**；是否绑定由 [HookEntry] 按 `listRemoteFiles()` 的结果决定）。
+     */
     private var remotePreferencesText: (() -> String?)? = null
 
     fun bindRemotePreferences(preferences: android.content.SharedPreferences?) {
@@ -337,13 +340,47 @@ internal object HookRuntime {
         remotePreferencesText = reader
     }
 
+    /** 文件通道失败后永久停用；原文缓存，避免高频读取每次都发 binder。 */
+    private var remoteTextBroken = false
+    private var remoteTextAt = 0L
+    private var remoteTextValue: String? = null
+    private const val REMOTE_TEXT_CACHE_MS = 2_000L
+
+    /**
+     * 读 prefs 文件原文的**唯一入口**。
+     *
+     * `openRemoteFile` 路径不合法时异常在守护进程侧记录（每调一次刷两行 JavaBinder），
+     * 客户端只拿到一个失败 —— 2026-11 之前这里传了带 `shared_prefs/` 的路径，实测每秒刷屏。
+     * 现在绑定前已由 `listRemoteFiles()` 把关；这里再做 2s 缓存，且**失败一次就永久停用**
+     * 本进程的文件通道，把「异常路径再次出现」的代价压到每进程最多一次。
+     * 停用后由远程偏好 / provider / 系统属性兜底。
+     */
+    private fun readRemotePreferencesText(): String? {
+        if (remoteTextBroken) return null
+        val now = SystemClock.elapsedRealtime()
+        if (now - remoteTextAt < REMOTE_TEXT_CACHE_MS) return remoteTextValue
+        remoteTextAt = now
+        val reader = remotePreferencesText ?: run {
+            remoteTextValue = null
+            return null
+        }
+        return runCatching { reader() }
+            .onFailure {
+                remoteTextBroken = true
+                log("模块 prefs 文件通道不可用，已停用：${it.javaClass.simpleName}: ${it.message}")
+            }
+            .getOrNull()
+            .also { remoteTextValue = it }
+    }
+
     /**
      * 读「解除景深遮挡限制」—— 远程偏好优先，读不到再**直接读 prefs 文件**（两条都不需要 Context）。
      *
      * 为什么要两条：`getRemotePreferences` 是框架通道，但**绑定时机**很关键
      * （HyperChanger 是在 `onPackageReady` 里现取的，我们一开始放在 `onModuleLoaded`，
      * 一旦那时拿到的是 null，SystemUI 里又没有可靠的 Context 兜底 ⇒ 整个功能静默失效）。
-     * 文件那条用 `openRemoteFile("shared_prefs/<name>.xml")`，不依赖 SharedPreferences 实现。
+     * 文件那条用 `openRemoteFile("<name>.xml")`（模块 `files/` 目录，裸文件名），不依赖
+     * SharedPreferences 实现；文件不存在时 [HookEntry] 根本不绑这条通道。
      */
     fun occlusionRemovedRemote(): Boolean {
         // 两条通道**取或**：任一条说"开着"就算开着。某条通道读不到/过期只会返回 false，
@@ -353,7 +390,7 @@ internal object HookRuntime {
                 .getOrDefault(false)
                 .let { if (it) return true }
         }
-        val xml = runCatching { remotePreferencesText?.invoke() }.getOrNull() ?: return false
+        val xml = readRemotePreferencesText() ?: return false
         return Regex("name=\"${MaskPrefs.KEY_DEPTH_OCCLUSION}\"\\s+value=\"true\"")
             .containsMatchIn(xml)
     }
@@ -371,7 +408,7 @@ internal object HookRuntime {
                 .getOrNull()
                 ?.let { return it }
         }
-        val xml = runCatching { remotePreferencesText?.invoke() }.getOrNull() ?: return null
+        val xml = readRemotePreferencesText() ?: return null
         return Regex("name=\"$key\"\\s+value=\"(-?\\d+)\"").find(xml)?.groupValues?.get(1)?.toIntOrNull()
     }
 
@@ -395,7 +432,7 @@ internal object HookRuntime {
 
     /** 通用远程偏好读取（**String**）。文件原文优先（同 [remoteBoolean] 的理由），框架通道兜底。 */
     fun remoteString(key: String): String? {
-        val xml = runCatching { remotePreferencesText?.invoke() }.getOrNull()
+        val xml = readRemotePreferencesText()
         if (xml != null) {
             Regex("name=\"$key\"\\s+value=\"([^\"]*)\"").find(xml)?.groupValues?.get(1)?.let { return it }
         }
@@ -405,7 +442,7 @@ internal object HookRuntime {
     }
 
     private fun readRemoteBoolean(key: String): Boolean? {
-        runCatching { remotePreferencesText?.invoke() }.getOrNull()?.let { xml ->
+        readRemotePreferencesText()?.let { xml ->
             Regex("name=\"$key\"\\s+value=\"(true|false)\"")
                 .find(xml)?.groupValues?.get(1)?.let { return it.toBoolean() }
         }
@@ -428,7 +465,7 @@ internal object HookRuntime {
     private const val REMOTE_BOOL_CACHE_MS = 300L
 
     /** 诊断用：把 prefs 文件原文整段读出来（读不到返回 null）。 */
-    fun remotePrefsTextOrNull(): String? = runCatching { remotePreferencesText?.invoke() }.getOrNull()
+    fun remotePrefsTextOrNull(): String? = readRemotePreferencesText()
 
     private var unlockAt = 0L
     private var unlockValue = false
@@ -1263,7 +1300,7 @@ internal object HookRuntime {
                 .getOrDefault(0L)
                 .let { if (it > token) token = it }
         }
-        val xml = runCatching { remotePreferencesText?.invoke() }.getOrNull()
+        val xml = readRemotePreferencesText()
         if (!xml.isNullOrEmpty()) {
             Regex("name=\"${MaskPrefs.KEY_PROBE_TOKEN}\"\\s+value=\"(\\d+)\"")
                 .find(xml)

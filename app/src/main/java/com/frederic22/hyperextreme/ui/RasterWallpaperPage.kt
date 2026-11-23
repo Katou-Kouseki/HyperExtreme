@@ -428,7 +428,13 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
      */
     fun applyGroup(g: RasterGroup) {
         if (mountMode != RASTER_MOUNT_SERVICE && g.id == activeId) return
-        val other = WallpaperConflict.running(ctx, state, WallpaperChain.RASTER)
+        val other = WallpaperConflict.running(
+            ctx,
+            state,
+            WallpaperChain.RASTER,
+            prefs.rasterScope,
+            if (mountMode == RASTER_MOUNT_SERVICE) WallpaperMode.SERVICE else WallpaperMode.HOOK,
+        )
         if (other != null) {
             conflictOther = other
             showConflict = true
